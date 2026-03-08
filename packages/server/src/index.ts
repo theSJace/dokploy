@@ -7,6 +7,8 @@ export * from "./lib/auth";
 export * from "./lib/logger";
 export * from "./monitoring/utils";
 export * from "./services/admin";
+export * from "./services/aws-deployment";
+export * from "./services/repo-scanner";
 export * from "./services/application";
 export * from "./services/backup";
 export * from "./services/bitbucket";

@@ -1,4 +1,5 @@
 export * from "./account";
+export * from "./aws-deployment";
 export * from "./ai";
 export * from "./application";
 export * from "./backups";
