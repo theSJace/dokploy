@@ -373,12 +373,26 @@ export const provisionAWSInfrastructure = async (
 		await updateAwsDeployment(awsDeploymentId, { s3BucketName: bucketName });
 		logFn(`[AWS] S3 bucket ready: ${bucketName}`);
 
+		// Resolve the effective subdomain: use the explicit one or auto-generate
+		// from parentDomain when the user did not supply a specific subdomain.
+		let effectiveSubdomain = config.subdomain ?? null;
+		if (!effectiveSubdomain && config.parentDomain) {
+			// Sanitise appName: lowercase, replace non-alphanumeric with hyphens
+			const safeAppName = appName
+				.toLowerCase()
+				.replace(/[^a-z0-9]+/g, "-")
+				.replace(/^-+|-+$/g, "");
+			effectiveSubdomain = `${safeAppName}.${config.parentDomain}`;
+			await updateAwsDeployment(awsDeploymentId, { subdomain: effectiveSubdomain });
+			logFn(`[AWS] Auto-generated subdomain: ${effectiveSubdomain}`);
+		}
+
 		// 2. CloudFront
 		logFn("[AWS] Creating CloudFront distribution…");
 		const { distributionId, domainName } = await provisionCloudFront(
 			{ ...config, s3BucketName: bucketName },
 			bucketName,
-			config.subdomain ?? undefined,
+			effectiveSubdomain ?? undefined,
 		);
 		await updateAwsDeployment(awsDeploymentId, {
 			cloudfrontDistributionId: distributionId,
@@ -386,16 +400,16 @@ export const provisionAWSInfrastructure = async (
 		});
 		logFn(`[AWS] CloudFront distribution created: ${domainName}`);
 
-		// 3. Route 53 (only if a custom subdomain is configured)
-		if (config.subdomain) {
-			logFn(`[AWS] Creating Route 53 record for ${config.subdomain}…`);
+		// 3. Route 53 (only if a subdomain is configured or was auto-generated)
+		if (effectiveSubdomain) {
+			logFn(`[AWS] Creating Route 53 record for ${effectiveSubdomain}…`);
 			const { hostedZoneId } = await provisionRoute53Subdomain(
 				config,
-				config.subdomain,
+				effectiveSubdomain,
 				domainName,
 			);
 			await updateAwsDeployment(awsDeploymentId, { route53HostedZoneId: hostedZoneId });
-			logFn(`[AWS] Subdomain ${config.subdomain} → ${domainName} (active in ~60s)`);
+			logFn(`[AWS] Subdomain ${effectiveSubdomain} → ${domainName} (active in ~60s)`);
 		}
 
 		await updateAwsDeployment(awsDeploymentId, { status: "active" });

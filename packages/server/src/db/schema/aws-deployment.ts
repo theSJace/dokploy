@@ -33,6 +33,7 @@ export const awsDeployments = pgTable("aws_deployment", {
 	// Route 53 – auto subdomain creation
 	route53HostedZoneId: text("route53HostedZoneId"), // optional; auto-looked-up from subdomain
 	subdomain: text("subdomain"), // e.g. myapp.example.com — created automatically
+	parentDomain: text("parentDomain"), // e.g. example.com — used to auto-generate subdomain when subdomain is not set
 	// Build configuration
 	buildCommand: text("buildCommand").default("npm run build"),
 	publishDirectory: text("publishDirectory").default("dist"),
@@ -58,6 +59,7 @@ const createSchema = createInsertSchema(awsDeployments, {
 	awsRegion: z.string().min(1),
 	s3BucketName: z.string().optional(),
 	subdomain: z.string().optional(),
+	parentDomain: z.string().optional(),
 	buildCommand: z.string().optional(),
 	publishDirectory: z.string().optional(),
 });
@@ -69,6 +71,7 @@ export const apiCreateAwsDeployment = createSchema
 		awsSecretAccessKey: true,
 		awsRegion: true,
 		subdomain: true,
+		parentDomain: true,
 		buildCommand: true,
 		publishDirectory: true,
 	})
@@ -83,6 +86,7 @@ export const apiUpdateAwsDeployment = createSchema
 		awsSecretAccessKey: true,
 		awsRegion: true,
 		subdomain: true,
+		parentDomain: true,
 		buildCommand: true,
 		publishDirectory: true,
 	})

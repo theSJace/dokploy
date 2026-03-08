@@ -51,6 +51,15 @@ const schema = z.object({
 	awsAccessKeyId: z.string().min(1, "AWS Access Key ID is required"),
 	awsSecretAccessKey: z.string().min(1, "AWS Secret Access Key is required"),
 	awsRegion: z.string().min(1, "Region is required"),
+	parentDomain: z
+		.string()
+		.optional()
+		.refine(
+			(val) =>
+				!val ||
+				/^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$/.test(val),
+			"Enter a valid domain (e.g. example.com)",
+		),
 	subdomain: z
 		.string()
 		.optional()
@@ -90,6 +99,7 @@ export const AwsDeploymentSetup = ({ applicationId }: Props) => {
 			awsAccessKeyId: "",
 			awsSecretAccessKey: "",
 			awsRegion: "us-east-1",
+			parentDomain: "",
 			subdomain: "",
 			buildCommand: "npm run build",
 			publishDirectory: "dist",
@@ -104,6 +114,7 @@ export const AwsDeploymentSetup = ({ applicationId }: Props) => {
 				awsAccessKeyId: existing.awsAccessKeyId,
 				awsSecretAccessKey: existing.awsSecretAccessKey,
 				awsRegion: existing.awsRegion,
+				parentDomain: existing.parentDomain ?? "",
 				subdomain: existing.subdomain ?? "",
 				buildCommand: existing.buildCommand ?? "npm run build",
 				publishDirectory: existing.publishDirectory ?? "dist",
@@ -118,6 +129,7 @@ export const AwsDeploymentSetup = ({ applicationId }: Props) => {
 			awsAccessKeyId: values.awsAccessKeyId,
 			awsSecretAccessKey: values.awsSecretAccessKey,
 			awsRegion: values.awsRegion,
+			parentDomain: values.parentDomain || undefined,
 			subdomain: values.subdomain || undefined,
 			buildCommand: values.buildCommand || "npm run build",
 			publishDirectory: values.publishDirectory || "dist",
@@ -238,13 +250,35 @@ export const AwsDeploymentSetup = ({ applicationId }: Props) => {
 							</h3>
 							<FormField
 								control={form.control}
-								name="subdomain"
+								name="parentDomain"
 								render={({ field }) => (
 									<FormItem>
 										<FormLabel className="flex items-center gap-1">
 											<Globe className="h-3.5 w-3.5" />
-											Subdomain
+											Parent Domain
 										</FormLabel>
+										<FormControl>
+											<Input
+												placeholder="example.com"
+												{...field}
+											/>
+										</FormControl>
+										<FormDescription>
+											Your root domain hosted in Route 53 (e.g.{" "}
+											<code>example.com</code>). When provided without a
+											custom subdomain, the system automatically creates{" "}
+											<code>&lt;app-name&gt;.example.com</code> in Route 53.
+										</FormDescription>
+										<FormMessage />
+									</FormItem>
+								)}
+							/>
+							<FormField
+								control={form.control}
+								name="subdomain"
+								render={({ field }) => (
+									<FormItem>
+										<FormLabel>Custom Subdomain (Optional Override)</FormLabel>
 										<FormControl>
 											<Input
 												placeholder="myapp.example.com"
@@ -252,8 +286,10 @@ export const AwsDeploymentSetup = ({ applicationId }: Props) => {
 											/>
 										</FormControl>
 										<FormDescription>
-											The subdomain will be automatically created in Route 53.
-											Leave blank to use the CloudFront URL.
+											Override the auto-generated subdomain with a specific
+											fully-qualified domain. Leave blank to auto-generate from
+											the Parent Domain above, or to use only the CloudFront URL
+											if no Parent Domain is set.
 										</FormDescription>
 										<FormMessage />
 									</FormItem>
