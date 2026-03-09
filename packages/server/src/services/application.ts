@@ -26,12 +26,18 @@ import {
 import { cloneGiteaRepository } from "@dokploy/server/utils/providers/gitea";
 import { cloneGithubRepository } from "@dokploy/server/utils/providers/github";
 import { cloneGitlabRepository } from "@dokploy/server/utils/providers/gitlab";
+import { getBuildAppDirectory } from "@dokploy/server/utils/filesystem/directory";
 import { createTraefikConfig } from "@dokploy/server/utils/traefik/application";
 import { TRPCError } from "@trpc/server";
 import { eq } from "drizzle-orm";
+import path from "node:path";
 import type { z } from "zod";
 import { encodeBase64 } from "../utils/docker/utils";
 import { getDokployUrl } from "./admin";
+import {
+	deployStaticToAWS,
+	findAwsDeploymentByApplicationId,
+} from "./aws-deployment";
 import {
 	createDeployment,
 	createDeploymentPreview,
@@ -188,6 +194,17 @@ export const deployApplication = async ({
 		description: descriptionLog,
 	});
 
+	// Helper: append a plain-text message to the deployment log
+	const appendToLog = async (msg: string) => {
+		const encoded = encodeBase64(`${msg}\n`);
+		const logCmd = `echo "${encoded}" | base64 -d >> "${deployment.logPath}"`;
+		if (serverId) {
+			await execAsyncRemote(serverId, logCmd);
+		} else {
+			await execAsync(logCmd);
+		}
+	};
+
 	try {
 		let command = "set -e;";
 		if (application.sourceType === "github") {
@@ -212,16 +229,55 @@ export const deployApplication = async ({
 			});
 		}
 
-		command += await getBuildCommand(application);
+		if (application.deploymentTarget === "aws_static") {
+			// ── AWS Static Deployment path ──────────────────────────────────────
+			// Look up the AWS config for build command and publish directory
+			const awsConfig = await findAwsDeploymentByApplicationId(applicationId);
+			const buildCmd = awsConfig?.buildCommand;
+			const publishDir = awsConfig?.publishDirectory || "dist";
 
-		const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
-		if (serverId) {
-			await execAsyncRemote(serverId, commandWithLog);
+			// Get the code directory (where the repo is cloned)
+			const codeDir = getBuildAppDirectory({
+				...application,
+				// getBuildAppDirectory uses buildType to determine path; for AWS
+				// static we always want the directory (not the Dockerfile path)
+				buildType: "nixpacks",
+			});
+
+			// Run the user-specified build command (e.g. npm install && npm run build)
+			if (buildCmd) {
+				command += `cd "${codeDir}" && npm install --include=dev && ${buildCmd};`;
+			}
+
+			const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
+			if (serverId) {
+				await execAsyncRemote(serverId, commandWithLog);
+			} else {
+				await execAsync(commandWithLog);
+			}
+
+			// Upload to S3 + CloudFront + Route 53 (auto-provisions on first deploy)
+			const localPublishDir = path.join(codeDir, publishDir);
+			await deployStaticToAWS(
+				applicationId,
+				application.appName,
+				localPublishDir,
+				appendToLog,
+			);
 		} else {
-			await execAsync(commandWithLog);
+			// ── Standard Docker/Server deployment path ──────────────────────────
+			command += await getBuildCommand(application);
+
+			const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
+			if (serverId) {
+				await execAsyncRemote(serverId, commandWithLog);
+			} else {
+				await execAsync(commandWithLog);
+			}
+
+			await mechanizeDockerContainer(application);
 		}
 
-		await mechanizeDockerContainer(application);
 		await updateDeploymentStatus(deployment.deploymentId, "done");
 		await updateApplicationStatus(applicationId, "done");
 
@@ -302,17 +358,59 @@ export const rebuildApplication = async ({
 		description: descriptionLog,
 	});
 
-	try {
-		let command = "set -e;";
-		// Check case for docker only
-		command += await getBuildCommand(application);
-		const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
+	const appendToLogRebuild = async (msg: string) => {
+		const encoded = encodeBase64(`${msg}\n`);
+		const logCmd = `echo "${encoded}" | base64 -d >> "${deployment.logPath}"`;
 		if (serverId) {
-			await execAsyncRemote(serverId, commandWithLog);
+			await execAsyncRemote(serverId, logCmd);
 		} else {
-			await execAsync(commandWithLog);
+			await execAsync(logCmd);
 		}
-		await mechanizeDockerContainer(application);
+	};
+
+	try {
+		if (application.deploymentTarget === "aws_static") {
+			// ── AWS Static Rebuild: re-upload current files from disk ────────────
+			const awsConfig = await findAwsDeploymentByApplicationId(applicationId);
+			const publishDir = awsConfig?.publishDirectory || "dist";
+			const codeDir = getBuildAppDirectory({
+				...application,
+				buildType: "nixpacks",
+			});
+			const localPublishDir = path.join(codeDir, publishDir);
+
+			const buildCmd = awsConfig?.buildCommand;
+			if (buildCmd) {
+				// Re-run build before re-uploading
+				const command = `set -e; cd "${codeDir}" && ${buildCmd}`;
+				const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
+				if (serverId) {
+					await execAsyncRemote(serverId, commandWithLog);
+				} else {
+					await execAsync(commandWithLog);
+				}
+			}
+
+			await deployStaticToAWS(
+				applicationId,
+				application.appName,
+				localPublishDir,
+				appendToLogRebuild,
+			);
+		} else {
+			// ── Standard Docker rebuild ──────────────────────────────────────────
+			let command = "set -e;";
+			// Check case for docker only
+			command += await getBuildCommand(application);
+			const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
+			if (serverId) {
+				await execAsyncRemote(serverId, commandWithLog);
+			} else {
+				await execAsync(commandWithLog);
+			}
+			await mechanizeDockerContainer(application);
+		}
+
 		await updateDeploymentStatus(deployment.deploymentId, "done");
 		await updateApplicationStatus(applicationId, "done");
 
