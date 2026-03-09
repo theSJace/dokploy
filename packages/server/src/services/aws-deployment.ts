@@ -2,41 +2,43 @@
  * AWS Static Deployment Service
  *
  * Handles automatic provisioning and deployment of static sites to:
- *   - AWS S3 (static website hosting)
- *   - AWS CloudFront (CDN)
- *   - AWS Route 53 (automatic subdomain creation)
+ *   - AWS S3 + CloudFront  (via CDK synthesis → CloudFormation)
+ *   - AWS Route 53          (automatic subdomain creation, direct SDK)
+ *
+ * Infrastructure lifecycle:
+ *   provision  → synthesize CDK stack → deploy CloudFormation → create Route 53 record
+ *   deploy     → upload files to S3   → invalidate CloudFront cache
+ *   teardown   → delete CloudFormation stack (preserves S3 bucket per RemovalPolicy.RETAIN)
  */
-import { readdir, readFile, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { readdir } from "node:fs/promises";
 import path from "node:path";
 import {
+	CloudFormationClient,
+	CreateStackCommand,
+	DeleteStackCommand,
+	DescribeStacksCommand,
+	UpdateStackCommand,
+	type Output,
+} from "@aws-sdk/client-cloudformation";
+import {
 	CloudFrontClient,
-	CreateDistributionCommand,
 	CreateInvalidationCommand,
-	GetDistributionCommand,
-	type DistributionConfig,
 } from "@aws-sdk/client-cloudfront";
 import {
 	ChangeResourceRecordSetsCommand,
 	ListHostedZonesCommand,
 	Route53Client,
 } from "@aws-sdk/client-route-53";
-import {
-	CreateBucketCommand,
-	DeleteObjectCommand,
-	ListObjectsV2Command,
-	PutBucketPolicyCommand,
-	PutBucketWebsiteCommand,
-	PutObjectCommand,
-	S3Client,
-} from "@aws-sdk/client-s3";
+import { S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { db } from "@dokploy/server/db";
 import { awsDeployments } from "@dokploy/server/db/schema";
 import { TRPCError } from "@trpc/server";
 import { eq } from "drizzle-orm";
-import { createReadStream } from "node:fs";
 import mime from "mime-types";
 import type { AwsDeployment } from "../db/schema/aws-deployment";
+import { synthesizeStaticSiteTemplate } from "./aws-cdk-stack";
 
 // ---------------------------------------------------------------------------
 // DB helpers
@@ -71,7 +73,10 @@ export const findAwsDeploymentById = async (awsDeploymentId: string) => {
 		where: eq(awsDeployments.awsDeploymentId, awsDeploymentId),
 	});
 	if (!record) {
-		throw new TRPCError({ code: "NOT_FOUND", message: "AWS deployment not found" });
+		throw new TRPCError({
+			code: "NOT_FOUND",
+			message: "AWS deployment not found",
+		});
 	}
 	return record;
 };
@@ -100,6 +105,15 @@ export const removeAwsDeployment = async (awsDeploymentId: string) => {
 // AWS client factories
 // ---------------------------------------------------------------------------
 
+const makeCFn = (config: AwsDeployment) =>
+	new CloudFormationClient({
+		region: config.awsRegion,
+		credentials: {
+			accessKeyId: config.awsAccessKeyId,
+			secretAccessKey: config.awsSecretAccessKey,
+		},
+	});
+
 const makeS3 = (config: AwsDeployment) =>
 	new S3Client({
 		region: config.awsRegion,
@@ -111,7 +125,6 @@ const makeS3 = (config: AwsDeployment) =>
 
 const makeCF = (config: AwsDeployment) =>
 	new CloudFrontClient({
-		// CloudFront is a global service but SDK must be pointed to us-east-1
 		region: "us-east-1",
 		credentials: {
 			accessKeyId: config.awsAccessKeyId,
@@ -129,160 +142,153 @@ const makeR53 = (config: AwsDeployment) =>
 	});
 
 // ---------------------------------------------------------------------------
-// S3 provisioning
+// CloudFormation stack deploy / teardown
 // ---------------------------------------------------------------------------
 
-/**
- * Create an S3 bucket configured for static website hosting.
- * If the bucket already exists and is owned by this account, it is reused.
- * Returns the bucket name (which may have been auto-generated).
- */
-export const provisionS3Bucket = async (
-	config: AwsDeployment,
-	appName: string,
-): Promise<string> => {
-	const s3 = makeS3(config);
-	// Derive a bucket name if not provided: dokploy-<appName>-<short-id>
-	const bucketName =
-		config.s3BucketName ||
-		`dokploy-${appName.toLowerCase().replace(/[^a-z0-9-]/g, "-")}-${config.awsDeploymentId.slice(-6)}`;
+/** Terminal stack statuses that end polling. */
+const CF_TERMINAL = new Set([
+	"CREATE_COMPLETE",
+	"UPDATE_COMPLETE",
+	"DELETE_COMPLETE",
+	"CREATE_FAILED",
+	"DELETE_FAILED",
+	"ROLLBACK_COMPLETE",
+	"ROLLBACK_FAILED",
+	"UPDATE_ROLLBACK_COMPLETE",
+	"UPDATE_ROLLBACK_FAILED",
+]);
 
-	// Create the bucket (will fail if it already exists in another account)
+/** Statuses that indicate a failure. */
+const CF_FAILED = new Set([
+	"CREATE_FAILED",
+	"DELETE_FAILED",
+	"ROLLBACK_COMPLETE",
+	"ROLLBACK_FAILED",
+	"UPDATE_ROLLBACK_COMPLETE",
+	"UPDATE_ROLLBACK_FAILED",
+]);
+
+/**
+ * Poll a CloudFormation stack until it reaches a terminal state.
+ * Throws on failure states.
+ */
+async function waitForStack(
+	cfn: CloudFormationClient,
+	stackName: string,
+	logFn: (msg: string) => void,
+): Promise<void> {
+	for (;;) {
+		await new Promise((r) => setTimeout(r, 6000)); // poll every 6 s
+		const { Stacks } = await cfn.send(
+			new DescribeStacksCommand({ StackName: stackName }),
+		);
+		const status = Stacks?.[0]?.StackStatus ?? "UNKNOWN";
+		logFn(`[AWS] Stack status: ${status}`);
+		if (CF_TERMINAL.has(status)) {
+			if (CF_FAILED.has(status)) {
+				const reason = Stacks?.[0]?.StackStatusReason ?? "";
+				throw new Error(
+					`CloudFormation stack "${stackName}" failed (${status})${reason ? `: ${reason}` : ""}`,
+				);
+			}
+			return;
+		}
+	}
+}
+
+/**
+ * Create or update a CloudFormation stack from a synthesized CDK template.
+ * Waits for the operation to complete and returns the stack outputs.
+ */
+async function deployCloudFormationStack(
+	config: AwsDeployment,
+	stackName: string,
+	templateBody: string,
+	logFn: (msg: string) => void,
+): Promise<Output[]> {
+	const cfn = makeCFn(config);
+
+	// Check whether the stack already exists
+	let stackExists = false;
 	try {
-		if (config.awsRegion === "us-east-1") {
-			await s3.send(new CreateBucketCommand({ Bucket: bucketName }));
-		} else {
-			await s3.send(
-				new CreateBucketCommand({
-					Bucket: bucketName,
-					CreateBucketConfiguration: { LocationConstraint: config.awsRegion as any },
+		const { Stacks } = await cfn.send(
+			new DescribeStacksCommand({ StackName: stackName }),
+		);
+		stackExists = !!Stacks?.length;
+	} catch {
+		// DescribeStacks throws when the stack does not exist
+	}
+
+	if (stackExists) {
+		logFn("[AWS] Updating existing CloudFormation stack…");
+		try {
+			await cfn.send(
+				new UpdateStackCommand({
+					StackName: stackName,
+					TemplateBody: templateBody,
+					Capabilities: ["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"],
 				}),
 			);
+		} catch (err: any) {
+			// CloudFormation throws ValidationError when there are no changes —
+			// treat this as success so we can still read the current outputs.
+			if (
+				err?.name === "ValidationError" &&
+				err?.message?.includes("No updates are to be performed")
+			) {
+				logFn("[AWS] No infrastructure changes detected — skipping update");
+			} else {
+				throw err;
+			}
 		}
-	} catch (err: any) {
-		// BucketAlreadyOwnedByYou is fine — bucket exists and belongs to this account
-		if (err?.name !== "BucketAlreadyOwnedByYou") {
-			throw err;
-		}
+	} else {
+		logFn("[AWS] Creating new CloudFormation stack…");
+		await cfn.send(
+			new CreateStackCommand({
+				StackName: stackName,
+				TemplateBody: templateBody,
+				Capabilities: ["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"],
+				OnFailure: "ROLLBACK",
+			}),
+		);
 	}
 
-	// Enable static website hosting
-	await s3.send(
-		new PutBucketWebsiteCommand({
-			Bucket: bucketName,
-			WebsiteConfiguration: {
-				IndexDocument: { Suffix: "index.html" },
-				ErrorDocument: { Key: "index.html" }, // SPA fallback
-			},
-		}),
+	await waitForStack(cfn, stackName, logFn);
+
+	const { Stacks } = await cfn.send(
+		new DescribeStacksCommand({ StackName: stackName }),
 	);
-
-	// Set a public-read bucket policy
-	const publicPolicy = JSON.stringify({
-		Version: "2012-10-17",
-		Statement: [
-			{
-				Sid: "PublicReadGetObject",
-				Effect: "Allow",
-				Principal: "*",
-				Action: "s3:GetObject",
-				Resource: `arn:aws:s3:::${bucketName}/*`,
-			},
-		],
-	});
-	await s3.send(
-		new PutBucketPolicyCommand({ Bucket: bucketName, Policy: publicPolicy }),
-	);
-
-	return bucketName;
-};
-
-// ---------------------------------------------------------------------------
-// CloudFront provisioning
-// ---------------------------------------------------------------------------
+	return Stacks?.[0]?.Outputs ?? [];
+}
 
 /**
- * Create a CloudFront distribution pointing to an S3 website endpoint.
- * Returns `{ distributionId, domainName }`.
+ * Delete a CloudFormation stack.
+ * The S3 bucket is NOT deleted because it has RemovalPolicy.RETAIN in the
+ * CDK stack — user data is preserved.
  */
-export const provisionCloudFront = async (
+export const teardownCloudFormationStack = async (
 	config: AwsDeployment,
-	bucketName: string,
-	customDomain?: string,
-): Promise<{ distributionId: string; domainName: string }> => {
-	const cf = makeCF(config);
-
-	const s3WebsiteOrigin = `${bucketName}.s3-website-${config.awsRegion}.amazonaws.com`;
-
-	const aliases = customDomain ? [customDomain] : undefined;
-
-	const distributionConfig: DistributionConfig = {
-		CallerReference: `dokploy-${config.awsDeploymentId}-${Date.now()}`,
-		Comment: `Dokploy static site – ${bucketName}`,
-		DefaultRootObject: "index.html",
-		Origins: {
-			Quantity: 1,
-			Items: [
-				{
-					Id: "S3Origin",
-					DomainName: s3WebsiteOrigin,
-					CustomOriginConfig: {
-						HTTPPort: 80,
-						HTTPSPort: 443,
-						OriginProtocolPolicy: "http-only",
-					},
-				},
-			],
-		},
-		DefaultCacheBehavior: {
-			TargetOriginId: "S3Origin",
-			ViewerProtocolPolicy: "redirect-to-https",
-			CachePolicyId: "658327ea-f89d-4fab-a63d-7e88639e58f6", // AWS managed: CachingOptimized
-			AllowedMethods: { Quantity: 2, Items: ["GET", "HEAD"] },
-			Compress: true,
-		},
-		CustomErrorResponses: {
-			Quantity: 1,
-			Items: [
-				{
-					ErrorCode: 403,
-					ResponseCode: "200",
-					ResponsePagePath: "/index.html",
-					ErrorCachingMinTTL: 0,
-				},
-			],
-		},
-		...(aliases ? { Aliases: { Quantity: aliases.length, Items: aliases } } : {}),
-		Enabled: true,
-		HttpVersion: "http2",
-		PriceClass: "PriceClass_100",
-	};
-
-	const response = await cf.send(
-		new CreateDistributionCommand({ DistributionConfig: distributionConfig }),
-	);
-
-	const distribution = response.Distribution;
-	if (!distribution?.Id || !distribution.DomainName) {
-		throw new Error("CloudFront distribution creation returned unexpected response");
-	}
-
-	return {
-		distributionId: distribution.Id,
-		domainName: distribution.DomainName,
-	};
+	logFn: (msg: string) => void = console.log,
+): Promise<void> => {
+	if (!config.cfStackName) return;
+	const cfn = makeCFn(config);
+	logFn(`[AWS] Deleting CloudFormation stack ${config.cfStackName}…`);
+	await cfn.send(new DeleteStackCommand({ StackName: config.cfStackName }));
+	await waitForStack(cfn, config.cfStackName, logFn);
+	logFn("[AWS] CloudFormation stack deleted");
 };
 
 // ---------------------------------------------------------------------------
-// Route 53 – automatic subdomain creation
+// Route 53 – automatic subdomain creation (direct SDK)
 // ---------------------------------------------------------------------------
 
 /**
- * Automatically find the Route 53 hosted zone for a given domain and create
- * an A-alias record pointing to the CloudFront distribution.
+ * Auto-discover the Route 53 hosted zone for a given fully-qualified domain
+ * and create (or upsert) an A-alias record pointing to a CloudFront domain.
  *
- * E.g. subdomain = "myapp.example.com" → finds hosted zone for "example.com"
- *      and creates an A alias record for "myapp.example.com" → CloudFront.
+ * Zone discovery walks up the subdomain tree until a matching hosted zone is
+ * found in the account (e.g. "app.sub.example.com" → tries "sub.example.com"
+ * then "example.com").
  */
 export const provisionRoute53Subdomain = async (
 	config: AwsDeployment,
@@ -290,19 +296,16 @@ export const provisionRoute53Subdomain = async (
 	cloudfrontDomainName: string,
 ): Promise<{ hostedZoneId: string }> => {
 	const r53 = makeR53(config);
-
-	// Auto-discover the hosted zone: strip subdomains until we find a match
 	const parts = subdomain.split(".");
-	let hostedZoneId = config.route53HostedZoneId || null;
+	let hostedZoneId = config.route53HostedZoneId ?? null;
 
 	if (!hostedZoneId) {
-		// Try each parent domain level (e.g. "myapp.sub.example.com" → "sub.example.com" → "example.com")
 		for (let i = 1; i < parts.length - 1; i++) {
 			const candidate = parts.slice(i).join(".");
 			const { HostedZones } = await r53.send(
 				new ListHostedZonesCommand({ MaxItems: "100" }),
 			);
-			const match = (HostedZones || []).find(
+			const match = (HostedZones ?? []).find(
 				(z) => z.Name === `${candidate}.` || z.Name === candidate,
 			);
 			if (match?.Id) {
@@ -315,11 +318,10 @@ export const provisionRoute53Subdomain = async (
 	if (!hostedZoneId) {
 		throw new TRPCError({
 			code: "BAD_REQUEST",
-			message: `Could not find a Route 53 hosted zone for subdomain "${subdomain}". Please ensure the parent domain is hosted in Route 53 under the provided AWS account.`,
+			message: `Could not find a Route 53 hosted zone for "${subdomain}". Ensure the parent domain is hosted in Route 53 under the provided AWS account.`,
 		});
 	}
 
-	// Create (or upsert) the A alias record
 	await r53.send(
 		new ChangeResourceRecordSetsCommand({
 			HostedZoneId: hostedZoneId,
@@ -331,7 +333,8 @@ export const provisionRoute53Subdomain = async (
 							Name: subdomain,
 							Type: "A",
 							AliasTarget: {
-								HostedZoneId: "Z2FDTNDATAQYW2", // CloudFront's hosted zone ID (fixed globally)
+								// CloudFront's fixed hosted zone ID (globally constant)
+								HostedZoneId: "Z2FDTNDATAQYW2",
 								DNSName: cloudfrontDomainName,
 								EvaluateTargetHealth: false,
 							},
@@ -351,11 +354,13 @@ export const provisionRoute53Subdomain = async (
 
 /**
  * Provision all AWS infrastructure for a static site:
- *   1. S3 bucket with website hosting
- *   2. CloudFront distribution
- *   3. Route 53 A-alias record (if subdomain is set)
+ *   1. Synthesize CDK stack → CloudFormation template (in-process, no CLI)
+ *   2. Create / update CloudFormation stack  → S3 bucket + CloudFront distribution
+ *   3. Read stack outputs → persist resource IDs to DB
+ *   4. Optionally create Route 53 A-alias record (direct SDK)
  *
- * Updates the `aws_deployment` record with the provisioned resource IDs.
+ * On retry the same stack name and bucket name are reused, so CloudFormation
+ * simply performs an idempotent update.
  */
 export const provisionAWSInfrastructure = async (
 	awsDeploymentId: string,
@@ -363,59 +368,74 @@ export const provisionAWSInfrastructure = async (
 	logFn: (msg: string) => void = console.log,
 ): Promise<void> => {
 	await updateAwsDeployment(awsDeploymentId, { status: "provisioning" });
-
 	const config = await findAwsDeploymentById(awsDeploymentId);
 
 	try {
-		// 1. S3
-		logFn("[AWS] Provisioning S3 bucket…");
-		const bucketName = await provisionS3Bucket(config, appName);
-		await updateAwsDeployment(awsDeploymentId, { s3BucketName: bucketName });
-		logFn(`[AWS] S3 bucket ready: ${bucketName}`);
+		// Derive safe, URL-friendly name fragments
+		const safeApp = appName
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-+|-+$/g, "");
+		const shortId = config.awsDeploymentId.slice(-6);
 
-		// Resolve the effective subdomain: use the explicit one or auto-generate
-		// from parentDomain when the user did not supply a specific subdomain.
+		// CloudFormation stack name must start with a letter, max 128 chars
+		const stackName = config.cfStackName ?? `dokploy-${safeApp}-${shortId}`;
+		// S3 bucket name: globally unique, same derivation
+		const bucketName =
+			config.s3BucketName ?? `dokploy-${safeApp}-${shortId}`;
+
+		// Persist derived names immediately so retries are idempotent
+		await updateAwsDeployment(awsDeploymentId, { cfStackName: stackName, s3BucketName: bucketName });
+
+		// Resolve effective subdomain (explicit > auto-generated > none)
 		let effectiveSubdomain = config.subdomain ?? null;
 		if (!effectiveSubdomain && config.parentDomain) {
-			// Sanitise appName: lowercase, replace non-alphanumeric with hyphens
-			const safeAppName = appName
-				.toLowerCase()
-				.replace(/[^a-z0-9]+/g, "-")
-				.replace(/^-+|-+$/g, "");
-			effectiveSubdomain = `${safeAppName}.${config.parentDomain}`;
+			effectiveSubdomain = `${safeApp}.${config.parentDomain}`;
 			await updateAwsDeployment(awsDeploymentId, { subdomain: effectiveSubdomain });
 			logFn(`[AWS] Auto-generated subdomain: ${effectiveSubdomain}`);
 		}
 
-		// 2. CloudFront
-		logFn("[AWS] Creating CloudFront distribution…");
-		const { distributionId, domainName } = await provisionCloudFront(
-			{ ...config, s3BucketName: bucketName },
-			bucketName,
-			effectiveSubdomain ?? undefined,
-		);
-		await updateAwsDeployment(awsDeploymentId, {
-			cloudfrontDistributionId: distributionId,
-			cloudfrontDomainName: domainName,
-		});
-		logFn(`[AWS] CloudFront distribution created: ${domainName}`);
+		// ── Step 1: CDK synthesis (in-process, no CLI required) ───────────────
+		logFn("[AWS] Synthesizing CDK stack → CloudFormation template…");
+		const templateBody = synthesizeStaticSiteTemplate({ stackName, bucketName });
+		logFn("[AWS] Synthesis complete");
 
-		// 3. Route 53 (only if a subdomain is configured or was auto-generated)
-		if (effectiveSubdomain) {
+		// ── Step 2: Deploy via CloudFormation ─────────────────────────────────
+		logFn("[AWS] Deploying CloudFormation stack (S3 + CloudFront)…");
+		const outputs = await deployCloudFormationStack(config, stackName, templateBody, logFn);
+
+		// ── Step 3: Read stack outputs ────────────────────────────────────────
+		const out = Object.fromEntries(
+			outputs
+				.filter((o) => o.OutputKey && o.OutputValue)
+				.map((o) => [o.OutputKey!, o.OutputValue!]),
+		);
+
+		await updateAwsDeployment(awsDeploymentId, {
+			s3BucketName: out["BucketName"] ?? bucketName,
+			cloudfrontDistributionId: out["DistributionId"] ?? null,
+			cloudfrontDomainName: out["CloudFrontDomain"] ?? null,
+		});
+
+		const cloudfrontDomain = out["CloudFrontDomain"] ?? null;
+		logFn(`[AWS] Stack deployed — CloudFront: ${cloudfrontDomain ?? "(pending)"}`);
+
+		// ── Step 4: Route 53 (direct SDK, needs runtime zone discovery) ───────
+		if (effectiveSubdomain && cloudfrontDomain) {
 			logFn(`[AWS] Creating Route 53 record for ${effectiveSubdomain}…`);
 			const { hostedZoneId } = await provisionRoute53Subdomain(
 				config,
 				effectiveSubdomain,
-				domainName,
+				cloudfrontDomain,
 			);
 			await updateAwsDeployment(awsDeploymentId, { route53HostedZoneId: hostedZoneId });
-			logFn(`[AWS] Subdomain ${effectiveSubdomain} → ${domainName} (active in ~60s)`);
+			logFn(`[AWS] ${effectiveSubdomain} → ${cloudfrontDomain} (DNS active in ~60s)`);
 		}
 
 		await updateAwsDeployment(awsDeploymentId, { status: "active" });
 		logFn("[AWS] Infrastructure provisioning complete ✓");
 	} catch (err: any) {
-		const message = err?.message || String(err);
+		const message = err?.message ?? String(err);
 		await updateAwsDeployment(awsDeploymentId, {
 			status: "error",
 			provisioningLog: message,
@@ -429,9 +449,6 @@ export const provisionAWSInfrastructure = async (
 // File upload to S3
 // ---------------------------------------------------------------------------
 
-/**
- * Recursively collect all files under a directory.
- */
 async function collectFiles(dir: string): Promise<string[]> {
 	const entries = await readdir(dir, { withFileTypes: true });
 	const results: string[] = [];
@@ -446,10 +463,7 @@ async function collectFiles(dir: string): Promise<string[]> {
 	return results;
 }
 
-/**
- * Upload all files from a local directory to an S3 bucket.
- * Uses streaming uploads for efficiency.
- */
+/** Recursively upload all files from a local directory to S3. */
 export const uploadStaticFilesToS3 = async (
 	config: AwsDeployment,
 	localDir: string,
@@ -467,8 +481,7 @@ export const uploadStaticFilesToS3 = async (
 	await Promise.all(
 		files.map(async (filePath) => {
 			const key = path.relative(localDir, filePath).replace(/\\/g, "/");
-			const contentType =
-				mime.lookup(filePath) || "application/octet-stream";
+			const contentType = mime.lookup(filePath) || "application/octet-stream";
 
 			const upload = new Upload({
 				client: s3,
@@ -479,7 +492,6 @@ export const uploadStaticFilesToS3 = async (
 					ContentType: contentType,
 				},
 			});
-
 			await upload.done();
 		}),
 	);
@@ -487,9 +499,7 @@ export const uploadStaticFilesToS3 = async (
 	logFn(`[AWS] Upload complete — ${files.length} files synced`);
 };
 
-/**
- * Invalidate the CloudFront cache for all paths ("/*").
- */
+/** Invalidate the CloudFront cache for all paths. */
 export const invalidateCloudFrontCache = async (
 	config: AwsDeployment,
 	logFn: (msg: string) => void = console.log,
@@ -510,17 +520,14 @@ export const invalidateCloudFrontCache = async (
 };
 
 // ---------------------------------------------------------------------------
-// Main deploy function (called from application.ts deployApplication)
+// Main deploy function
 // ---------------------------------------------------------------------------
 
 /**
  * Full deploy cycle for an AWS static site:
- *   1. Ensure infrastructure is provisioned (S3 + CloudFront + Route 53)
- *   2. Upload static files from `localPublishDir`
+ *   1. Ensure infrastructure is provisioned (CDK → CloudFormation → Route 53)
+ *   2. Upload static files from `localPublishDir` to S3
  *   3. Invalidate CloudFront cache
- *
- * `localPublishDir` = the directory on the Dokploy host that contains the
- * built static files (e.g. /etc/dokploy/applications/myapp/code/dist).
  */
 export const deployStaticToAWS = async (
 	applicationId: string,
@@ -542,13 +549,9 @@ export const deployStaticToAWS = async (
 		config = await findAwsDeploymentById(config.awsDeploymentId);
 	}
 
-	// Upload files
 	await uploadStaticFilesToS3(config, localPublishDir, logFn);
-
-	// Invalidate cache
 	await invalidateCloudFrontCache(config, logFn);
 
-	// Log the live URL
 	const liveUrl = config.subdomain
 		? `https://${config.subdomain}`
 		: config.cloudfrontDomainName

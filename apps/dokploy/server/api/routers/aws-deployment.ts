@@ -54,8 +54,9 @@ export const awsDeploymentRouter = createTRPCRouter({
 					buildCommand: input.buildCommand,
 					publishDirectory: input.publishDirectory,
 					s3BucketName: input.s3BucketName,
-					// Reset provisioning status so it re-provisions on next deploy
+					// Reset provisioning state so re-provisioning picks up changes
 					status: "pending",
+					cfStackName: null,
 					cloudfrontDistributionId: null,
 					cloudfrontDomainName: null,
 					route53HostedZoneId: null,

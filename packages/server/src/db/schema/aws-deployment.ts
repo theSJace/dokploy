@@ -30,6 +30,8 @@ export const awsDeployments = pgTable("aws_deployment", {
 	// CloudFront
 	cloudfrontDistributionId: text("cloudfrontDistributionId"),
 	cloudfrontDomainName: text("cloudfrontDomainName"), // e.g. d123abc.cloudfront.net
+	// CloudFormation (CDK-managed infrastructure)
+	cfStackName: text("cfStackName"), // CloudFormation stack name, e.g. dokploy-myapp-abc123
 	// Route 53 – auto subdomain creation
 	route53HostedZoneId: text("route53HostedZoneId"), // optional; auto-looked-up from subdomain
 	subdomain: text("subdomain"), // e.g. myapp.example.com — created automatically
