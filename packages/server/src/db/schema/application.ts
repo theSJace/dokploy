@@ -70,6 +70,11 @@ export const buildType = pgEnum("buildType", [
 	"railpack",
 ]);
 
+export const deploymentTarget = pgEnum("deploymentTarget", [
+	"server",
+	"aws_static",
+]);
+
 export const applications = pgTable("application", {
 	applicationId: text("applicationId")
 		.notNull()
@@ -182,6 +187,9 @@ export const applications = pgTable("application", {
 		.notNull()
 		.default("idle"),
 	buildType: buildType("buildType").notNull().default("nixpacks"),
+	deploymentTarget: deploymentTarget("deploymentTarget")
+		.notNull()
+		.default("server"),
 	railpackVersion: text("railpackVersion").default("0.15.4"),
 	herokuVersion: text("herokuVersion").default("24"),
 	publishDirectory: text("publishDirectory"),
@@ -341,6 +349,7 @@ const createSchema = createInsertSchema(applications, {
 		"static",
 		"railpack",
 	]),
+	deploymentTarget: z.enum(["server", "aws_static"]).optional(),
 	railpackVersion: z.string().optional(),
 	herokuVersion: z.string().optional(),
 	publishDirectory: z.string().optional(),
