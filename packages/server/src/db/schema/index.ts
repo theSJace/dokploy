@@ -1,6 +1,7 @@
 export * from "./account";
 export * from "./ai";
 export * from "./application";
+export * from "./aws-deployment";
 export * from "./backups";
 export * from "./bitbucket";
 export * from "./certificate";

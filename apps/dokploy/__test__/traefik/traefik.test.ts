@@ -4,6 +4,7 @@ import { expect, test } from "vitest";
 
 const baseApp: ApplicationNested = {
 	railpackVersion: "0.15.4",
+	deploymentTarget: "server",
 	rollbackActive: false,
 	applicationId: "",
 	previewLabels: [],

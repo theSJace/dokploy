@@ -30,6 +30,14 @@
     "generate:drizzle": "pnpm dlx  @better-auth/cli generate --output auth-schema2.ts --config src/lib/auth.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudformation": "^3.758.0",
+    "@aws-sdk/client-cloudfront": "^3.758.0",
+    "@aws-sdk/client-route-53": "^3.758.0",
+    "@aws-sdk/client-s3": "^3.758.0",
+    "@aws-sdk/lib-storage": "^3.758.0",
+    "aws-cdk-lib": "^2.180.0",
+    "constructs": "^10.4.2",
+    "mime-types": "^2.1.35",
     "@ai-sdk/anthropic": "^3.0.44",
     "@ai-sdk/azure": "^3.0.30",
     "@ai-sdk/cohere": "^3.0.21",
@@ -93,6 +101,7 @@
     "@types/bcrypt": "5.0.2",
     "@types/dockerode": "3.3.23",
     "@types/lodash": "4.17.4",
+    "@types/mime-types": "^2.1.4",
     "@types/micromatch": "4.0.9",
     "@types/node": "^24.4.0",
     "@types/node-schedule": "2.1.6",
