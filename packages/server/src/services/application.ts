@@ -244,9 +244,15 @@ export const deployApplication = async ({
 				buildType: "nixpacks",
 			});
 
-			// Run the user-specified build command (e.g. npm install && npm run build)
+			// Run the user-specified build command (e.g. npm run build)
+			// Detect the package manager from lockfiles to support npm/yarn/pnpm/bun
 			if (buildCmd) {
-				command += `cd "${codeDir}" && npm install --include=dev && ${buildCmd};`;
+				const installCmd =
+					`if [ -f "${codeDir}/bun.lockb" ]; then bun install; ` +
+					`elif [ -f "${codeDir}/pnpm-lock.yaml" ]; then pnpm install --frozen-lockfile || pnpm install; ` +
+					`elif [ -f "${codeDir}/yarn.lock" ]; then yarn install --frozen-lockfile || yarn install; ` +
+					"else npm install --include=dev; fi";
+				command += `cd "${codeDir}" && ${installCmd} && ${buildCmd};`;
 			}
 
 			const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;

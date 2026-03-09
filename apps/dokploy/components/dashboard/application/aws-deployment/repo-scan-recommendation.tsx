@@ -64,7 +64,7 @@ export const RepoScanRecommendation = ({ applicationId, onApply }: Props) => {
 			.catch((err) => {
 				const message =
 					err?.message?.includes("ENOENT") || err?.message?.includes("no such")
-						? "Repository has not been cloned yet. Deploy once to allow scanning."
+						? "Repository not yet cloned. Trigger an initial deployment to clone the repository before scanning."
 						: "Error scanning repository";
 				toast.error(message);
 			});

@@ -346,13 +346,12 @@ export const scanRepository = async (repoPath: string): Promise<ScanResult> => {
 	// Vite (React/Vue/Svelte/vanilla via Vite)
 	if (deps.vite || deps["@vitejs/plugin-react"] || deps["@vitejs/plugin-vue"]) {
 		signals.push("Found Vite");
-		const publishDir = scripts.build?.includes("--outDir") ? "custom" : "dist";
 		return {
 			detectedType: "vite",
 			recommendedBuildType: "nixpacks",
 			recommendedDeploymentTarget: "aws_static",
 			recommendedBuildCommand: "npm run build",
-			recommendedPublishDirectory: publishDir === "custom" ? "dist" : "dist",
+			recommendedPublishDirectory: "dist",
 			confidence: "high",
 			signals,
 		};

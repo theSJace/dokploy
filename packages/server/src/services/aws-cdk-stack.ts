@@ -14,6 +14,9 @@
  *   const templateBody = synthesizeStaticSiteTemplate({ stackName, bucketName, region });
  *   // → JSON CloudFormation template ready to pass to CreateStack / UpdateStack
  */
+
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as cdk from "aws-cdk-lib";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as cfOrigins from "aws-cdk-lib/aws-cloudfront-origins";
@@ -113,7 +116,7 @@ export function synthesizeStaticSiteTemplate(params: {
 	/** S3 bucket name to create. */
 	bucketName: string;
 }): string {
-	const app = new cdk.App({ outdir: "/tmp/cdk-dokploy-synth" });
+	const app = new cdk.App({ outdir: join(tmpdir(), "cdk-dokploy-synth") });
 
 	new StaticSiteStack(app, params.stackName, {
 		// Environment-agnostic: region/account resolved by CloudFormation at
