@@ -7,7 +7,7 @@
  *
  * Infrastructure lifecycle:
  *   provision  → synthesize CDK stack → deploy CloudFormation → create Route 53 record
- *   deploy     → upload files to S3   → invalidate CloudFront cache
+ *   deploy     → sync files to S3 (delete stale + upload) → invalidate CloudFront cache
  *   teardown   → delete CloudFormation stack (preserves S3 bucket per RemovalPolicy.RETAIN)
  */
 import { createReadStream } from "node:fs";
@@ -30,7 +30,11 @@ import {
 	ListHostedZonesCommand,
 	Route53Client,
 } from "@aws-sdk/client-route-53";
-import { S3Client } from "@aws-sdk/client-s3";
+import {
+	DeleteObjectsCommand,
+	ListObjectsV2Command,
+	S3Client,
+} from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { db } from "@dokploy/server/db";
 import { awsDeployments } from "@dokploy/server/db/schema";
@@ -463,8 +467,13 @@ async function collectFiles(dir: string): Promise<string[]> {
 	return results;
 }
 
-/** Recursively upload all files from a local directory to S3. */
-export const uploadStaticFilesToS3 = async (
+/**
+ * Sync local build output to S3:
+ *   1. List all existing S3 keys
+ *   2. Delete keys that are no longer in the local build output
+ *   3. Upload all local files (adds new, overwrites changed)
+ */
+export const syncStaticFilesWithS3 = async (
 	config: AwsDeployment,
 	localDir: string,
 	logFn: (msg: string) => void = console.log,
@@ -475,11 +484,52 @@ export const uploadStaticFilesToS3 = async (
 		throw new Error("S3 bucket name not configured — run provisioning first");
 	}
 
-	const files = await collectFiles(localDir);
-	logFn(`[AWS] Uploading ${files.length} files to s3://${bucketName}…`);
+	// ── Step 1: List all existing S3 keys (paginated) ─────────────────────
+	const existingKeys = new Set<string>();
+	let continuationToken: string | undefined;
+	do {
+		const res = await s3.send(
+			new ListObjectsV2Command({
+				Bucket: bucketName,
+				ContinuationToken: continuationToken,
+			}),
+		);
+		for (const obj of res.Contents ?? []) {
+			if (obj.Key) existingKeys.add(obj.Key);
+		}
+		continuationToken = res.NextContinuationToken;
+	} while (continuationToken);
 
+	// ── Step 2: Collect local file keys ───────────────────────────────────
+	const localFiles = await collectFiles(localDir);
+	const localKeys = new Set(
+		localFiles.map((f) => path.relative(localDir, f).replace(/\\/g, "/")),
+	);
+
+	// ── Step 3: Delete stale keys (in S3 but not in local build) ──────────
+	const staleKeys = [...existingKeys].filter((k) => !localKeys.has(k));
+	if (staleKeys.length > 0) {
+		logFn(`[AWS] Removing ${staleKeys.length} stale file(s) from s3://${bucketName}…`);
+		// DeleteObjects accepts max 1000 keys per request
+		for (let i = 0; i < staleKeys.length; i += 1000) {
+			const batch = staleKeys.slice(i, i + 1000);
+			await s3.send(
+				new DeleteObjectsCommand({
+					Bucket: bucketName,
+					Delete: {
+						Objects: batch.map((Key) => ({ Key })),
+						Quiet: true,
+					},
+				}),
+			);
+		}
+		logFn(`[AWS] Removed ${staleKeys.length} stale file(s)`);
+	}
+
+	// ── Step 4: Upload all local files ────────────────────────────────────
+	logFn(`[AWS] Uploading ${localFiles.length} files to s3://${bucketName}…`);
 	await Promise.all(
-		files.map(async (filePath) => {
+		localFiles.map(async (filePath) => {
 			const key = path.relative(localDir, filePath).replace(/\\/g, "/");
 			const contentType = mime.lookup(filePath) || "application/octet-stream";
 
@@ -496,7 +546,7 @@ export const uploadStaticFilesToS3 = async (
 		}),
 	);
 
-	logFn(`[AWS] Upload complete — ${files.length} files synced`);
+	logFn(`[AWS] Sync complete — ${localFiles.length} uploaded, ${staleKeys.length} removed`);
 };
 
 /** Invalidate the CloudFront cache for all paths. */
@@ -526,7 +576,7 @@ export const invalidateCloudFrontCache = async (
 /**
  * Full deploy cycle for an AWS static site:
  *   1. Ensure infrastructure is provisioned (CDK → CloudFormation → Route 53)
- *   2. Upload static files from `localPublishDir` to S3
+ *   2. Sync static files: delete stale S3 objects, upload new/changed files
  *   3. Invalidate CloudFront cache
  */
 export const deployStaticToAWS = async (
@@ -549,7 +599,7 @@ export const deployStaticToAWS = async (
 		config = await findAwsDeploymentById(config.awsDeploymentId);
 	}
 
-	await uploadStaticFilesToS3(config, localPublishDir, logFn);
+	await syncStaticFilesWithS3(config, localPublishDir, logFn);
 	await invalidateCloudFrontCache(config, logFn);
 
 	const liveUrl = config.subdomain
